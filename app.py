@@ -3,11 +3,17 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from db_sync import get_connection, init_db, pull_db_from_github, push_db_to_github
+from db_sync import (
+    get_connection,
+    get_objectif_annee,
+    init_db,
+    pull_db_from_github,
+    push_db_to_github,
+    set_objectif_annee,
+)
 
 st.set_page_config(page_title="CRM Affaires", layout="wide")
 
-# Chargement initial depuis GitHub une seule fois par session
 if "db_loaded" not in st.session_state:
     pull_db_from_github()
     init_db()
@@ -25,20 +31,36 @@ TYPES_MAT = [
 
 st.title("Suivi des Affaires Commerciales")
 
-# Barre latérale : objectif annuel, synchro manuelle & export Excel
+# Barre latérale : exercice fiscal, objectif annuel mémorisé, synchro & export
 with st.sidebar:
-    st.header("Objectif Commercial")
-    objectif_ca = st.number_input(
-        "Objectif CA annuel (€ HT)",
-        min_value=0,
-        value=4000000,
-        step=100000,
+    st.header("Exercice & Objectif")
+    annee_courante = date.today().year
+    annees_dispo = list(range(annee_courante - 1, annee_courante + 4))
+    annee_sel = st.selectbox(
+        "Année fiscale",
+        annees_dispo,
+        index=annees_dispo.index(annee_courante),
     )
+
+    objectif_actuel = get_objectif_annee(annee_sel, defaut=4000000.0)
+    objectif_ca = st.number_input(
+        f"Objectif {annee_sel} (€ HT)",
+        min_value=0.0,
+        value=objectif_actuel,
+        step=100000.0,
+        format="%.0f",
+    )
+
+    if st.button(f"Enregistrer objectif {annee_sel}", use_container_width=True):
+        set_objectif_annee(annee_sel, objectif_ca)
+        push_db_to_github(f"Objectif CA {annee_sel} : {objectif_ca:,.0f} €")
+        st.success(f"Objectif {annee_sel} sauvegardé.")
 
     st.divider()
     st.header("Synchronisation")
     if st.button("Forcer rechargement GitHub", use_container_width=True):
         if pull_db_from_github():
+            init_db()
             st.success("Base rechargée depuis GitHub.")
             st.rerun()
         else:
@@ -48,6 +70,7 @@ with st.sidebar:
     df_aff_exp = pd.read_sql("SELECT * FROM affaires", conn)
     df_cli_exp = pd.read_sql("SELECT * FROM clients", conn)
     df_his_exp = pd.read_sql("SELECT * FROM historique", conn)
+    df_obj_exp = pd.read_sql("SELECT * FROM objectifs", conn)
     conn.close()
 
     buffer = io.BytesIO()
@@ -55,6 +78,7 @@ with st.sidebar:
         df_aff_exp.to_excel(writer, sheet_name="Affaires", index=False)
         df_cli_exp.to_excel(writer, sheet_name="Clients", index=False)
         df_his_exp.to_excel(writer, sheet_name="Historique", index=False)
+        df_obj_exp.to_excel(writer, sheet_name="Objectifs", index=False)
 
     st.download_button(
         label="Exporter en Excel (.xlsx)",
@@ -77,10 +101,13 @@ with tab1:
     df_aff = pd.read_sql("SELECT * FROM affaires", conn)
     conn.close()
 
-    en_cours = df_aff[
-        df_aff["statut"].isin(["À chiffrer", "Offre envoyée", "En négo"])
+    df_aff["date_dt"] = pd.to_datetime(df_aff["date_creation"], errors="coerce")
+    df_annee = df_aff[df_aff["date_dt"].dt.year == annee_sel].copy()
+
+    en_cours = df_annee[
+        df_annee["statut"].isin(["À chiffrer", "Offre envoyée", "En négo"])
     ]
-    gagne = df_aff[df_aff["statut"] == "Gagné"]
+    gagne = df_annee[df_annee["statut"] == "Gagné"]
 
     ca_pipe = en_cours["montant_ht"].sum()
     ca_pondere = (en_cours["montant_ht"] * en_cours["probabilite"] / 100).sum()
@@ -89,112 +116,103 @@ with tab1:
     taux_atteinte = (ca_gagne / objectif_ca * 100) if objectif_ca > 0 else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pipe en cours", f"{ca_pipe:,.0f} €".replace(",", " "))
+    c1.metric(f"Pipe en cours ({annee_sel})", f"{ca_pipe:,.0f} €".replace(",", " "))
     c2.metric("CA pondéré pipe", f"{ca_pondere:,.0f} €".replace(",", " "))
     c3.metric("Marge moy. pipe", f"{marge_moy:.1f} %")
     c4.metric(
-        "CA Gagné",
+        f"CA Gagné ({annee_sel})",
         f"{ca_gagne:,.0f} €".replace(",", " "),
         delta=f"{taux_atteinte:.1f} % de l'objectif",
     )
 
     st.divider()
-    st.subheader("Avancement du CA par rapport à l'objectif")
+    st.subheader(f"Avancement du CA {annee_sel} par rapport à l'objectif")
 
-    if not df_aff.empty:
-        df_plot = df_aff.copy()
-        df_plot["date_dt"] = pd.to_datetime(df_plot["date_creation"], errors="coerce")
-        df_plot = df_plot.dropna(subset=["date_dt"])
+    tous_mois = pd.date_range(
+        start=f"{annee_sel}-01-01",
+        end=f"{annee_sel}-12-01",
+        freq="MS",
+    )
 
-        if not df_plot.empty:
-            df_plot["mois"] = df_plot["date_dt"].dt.to_period("M").dt.to_timestamp()
-            tous_mois = pd.date_range(
-                df_plot["mois"].min(),
-                max(df_plot["mois"].max(), pd.Timestamp(date.today()).to_period("M").to_timestamp()),
-                freq="MS",
-            )
+    df_plot = df_annee.dropna(subset=["date_dt"]).copy()
+    df_plot["mois"] = df_plot["date_dt"].dt.to_period("M").dt.to_timestamp()
 
-            # CA gagné mensuel et cumulé
-            gagne_m = (
-                df_plot[df_plot["statut"] == "Gagné"]
-                .groupby("mois")["montant_ht"]
-                .sum()
-                .reindex(tous_mois, fill_value=0)
-                .cumsum()
-            )
+    gagne_m = (
+        df_plot[df_plot["statut"] == "Gagné"]
+        .groupby("mois")["montant_ht"]
+        .sum()
+        .reindex(tous_mois, fill_value=0)
+        .cumsum()
+    )
 
-            # CA pondéré (affaires en cours) mensuel et cumulé
-            en_cours_df = df_plot[
-                df_plot["statut"].isin(["À chiffrer", "Offre envoyée", "En négo"])
-            ].copy()
-            en_cours_df["ca_pond"] = (
-                en_cours_df["montant_ht"] * en_cours_df["probabilite"] / 100
-            )
-            pondere_m = (
-                en_cours_df.groupby("mois")["ca_pond"]
-                .sum()
-                .reindex(tous_mois, fill_value=0)
-                .cumsum()
-            )
+    en_cours_df = df_plot[
+        df_plot["statut"].isin(["À chiffrer", "Offre envoyée", "En négo"])
+    ].copy()
+    en_cours_df["ca_pond"] = (
+        en_cours_df["montant_ht"] * en_cours_df["probabilite"] / 100
+    )
+    pondere_m = (
+        en_cours_df.groupby("mois")["ca_pond"]
+        .sum()
+        .reindex(tous_mois, fill_value=0)
+        .cumsum()
+    )
 
-            fig = go.Figure()
+    fig = go.Figure()
 
-            # Courbe CA Gagné cumulé
-            fig.add_trace(
-                go.Scatter(
-                    x=tous_mois,
-                    y=gagne_m.values,
-                    mode="lines+markers",
-                    name="CA Gagné (cumulé)",
-                    line=dict(color="#16a34a", width=3),
-                    hovertemplate="%{x|%b %Y}<br>CA Gagné : %{y:,.0f} €<extra></extra>",
-                )
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=tous_mois,
+            y=gagne_m.values,
+            mode="lines+markers",
+            name="CA Gagné (cumulé)",
+            line=dict(color="#16a34a", width=3),
+            hovertemplate="%{x|%b %Y}<br>CA Gagné : %{y:,.0f} €<extra></extra>",
+        )
+    )
 
-            # Courbe CA Pondéré cumulé
-            fig.add_trace(
-                go.Scatter(
-                    x=tous_mois,
-                    y=pondere_m.values,
-                    mode="lines+markers",
-                    name="CA Pondéré pipe (cumulé)",
-                    line=dict(color="#2563eb", width=3, dash="dot"),
-                    hovertemplate="%{x|%b %Y}<br>CA Pondéré : %{y:,.0f} €<extra></extra>",
-                )
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=tous_mois,
+            y=pondere_m.values,
+            mode="lines+markers",
+            name="CA Pondéré pipe (cumulé)",
+            line=dict(color="#2563eb", width=3, dash="dot"),
+            hovertemplate="%{x|%b %Y}<br>CA Pondéré : %{y:,.0f} €<extra></extra>",
+        )
+    )
 
-            # Ligne horizontale d'objectif
-            fig.add_hline(
-                y=objectif_ca,
-                line_dash="dash",
-                line_color="#dc2626",
-                line_width=2,
-                annotation_text=f"Objectif : {objectif_ca:,.0f} €".replace(",", " "),
-                annotation_position="top left",
-            )
+    fig.add_hline(
+        y=objectif_ca,
+        line_dash="dash",
+        line_color="#dc2626",
+        line_width=2,
+        annotation_text=f"Objectif {annee_sel} : {objectif_ca:,.0f} €".replace(",", " "),
+        annotation_position="top left",
+    )
 
-            fig.update_layout(
-                height=380,
-                margin=dict(l=20, r=20, t=30, b=20),
-                yaxis_title="Montant HT (€)",
-                xaxis_title="Mois",
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Renseigne des affaires avec une date valide pour afficher la courbe.")
-    else:
-        st.info("Ajoute ta première affaire pour visualiser les courbes d'avancement.")
+    fig.update_layout(
+        height=380,
+        margin=dict(l=20, r=20, t=30, b=20),
+        yaxis_title="Montant HT (€)",
+        xaxis_title="Mois",
+        xaxis=dict(dtick="M1", tickformat="%b"),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
-    st.subheader("Relances prioritaires (aujourd'hui ou en retard)")
+    st.subheader("Relances prioritaires (toutes années confondues)")
 
+    en_cours_global = df_aff[
+        df_aff["statut"].isin(["À chiffrer", "Offre envoyée", "En négo"])
+    ]
     today_str = date.today().isoformat()
-    a_relancer = en_cours[
-        (en_cours["date_relance"].notna())
-        & (en_cours["date_relance"] != "")
-        & (en_cours["date_relance"] <= today_str)
+    a_relancer = en_cours_global[
+        (en_cours_global["date_relance"].notna())
+        & (en_cours_global["date_relance"] != "")
+        & (en_cours_global["date_relance"] <= today_str)
     ].sort_values("date_relance")
 
     if a_relancer.empty:
@@ -250,7 +268,7 @@ with tab2:
         df_filtre,
         use_container_width=True,
         hide_index=True,
-        disabled=["id", "num_offre", "date_creation"],
+        disabled=["id", "num_offre"],
         column_config={
             "statut": st.column_config.SelectboxColumn(
                 "Statut", options=STATUTS, required=True
@@ -277,12 +295,13 @@ with tab2:
             cur.execute(
                 """
                 UPDATE affaires
-                SET client=?, contact=?, intitule=?, typologie_materiel=?,
+                SET date_creation=?, client=?, contact=?, intitule=?, typologie_materiel=?,
                     montant_ht=?, marge_pct=?, statut=?, probabilite=?,
                     date_relance=?, lien_dossier=?
                 WHERE id=?
             """,
                 (
+                    row["date_creation"],
                     row["client"],
                     row["contact"],
                     row["intitule"],
