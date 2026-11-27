@@ -1,9 +1,7 @@
 import base64
 import os
-import shutil
 import sqlite3
 from datetime import datetime
-import pandas as pd
 import requests
 import streamlit as st
 
@@ -14,7 +12,7 @@ def get_github_config():
     try:
         return {
             "token": st.secrets["GITHUB_TOKEN"],
-            "repo": st.secrets["GITHUB_REPO"],  # ex: "tonpseudo/crm-pro"
+            "repo": st.secrets["GITHUB_REPO"],
             "branch": st.secrets.get("GITHUB_BRANCH", "main"),
         }
     except Exception:
@@ -53,7 +51,6 @@ def push_db_to_github(commit_msg="Mise à jour CRM"):
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # 1. Mise à jour du fichier principal
     url_main = f"https://api.github.com/repos/{cfg['repo']}/contents/{DB_FILE}"
     r_get = requests.get(url_main, headers=headers)
     sha = r_get.json().get("sha") if r_get.status_code == 200 else None
@@ -68,7 +65,6 @@ def push_db_to_github(commit_msg="Mise à jour CRM"):
 
     r_put = requests.put(url_main, json=payload, headers=headers)
 
-    # 2. Backup horodaté dans backups/
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     url_bkp = f"https://api.github.com/repos/{cfg['repo']}/contents/backups/crm_{ts}.db"
     payload_bkp = {
@@ -126,9 +122,39 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS objectifs (
+            annee INTEGER PRIMARY KEY,
+            montant_objectif REAL NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
 
 def get_connection():
     return sqlite3.connect(DB_FILE)
+
+
+def get_objectif_annee(annee: int, defaut: float = 4000000.0) -> float:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT montant_objectif FROM objectifs WHERE annee = ?", (annee,))
+    row = cur.fetchone()
+    conn.close()
+    return float(row[0]) if row else defaut
+
+
+def set_objectif_annee(annee: int, montant: float):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO objectifs (annee, montant_objectif)
+        VALUES (?, ?)
+        ON CONFLICT(annee) DO UPDATE SET montant_objectif = excluded.montant_objectif
+        """,
+        (annee, montant),
+    )
+    conn.commit()
+    conn.close()
